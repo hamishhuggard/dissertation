@@ -1,0 +1,402 @@
+---
+title: "Interpolate"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r intro}
+library('corrplot')
+library("ggplot2")
+library('xtable')
+library('caret')
+library('MASS')
+library('reshape2')
+library('deldir')
+library('ggmap')
+library('automap')
+library('gstat')
+
+setwd("Desktop/repo/The Good Code for Reals")
+load(file="calc_errs.rda")
+load(file="odin_data.rda")
+calibrated.data <- readRDS('calibrated_data.rds')
+```
+
+## Linear Interpolation
+
+```{r linear}
+test.linearity <- function(ids) {
+  # Evaluate how well three odins form a line
+  # The smaller the return value the better the odins form a straight line
+  # ids = a vector of three odin ids in the order that they should line up
+  x.1 <- odin.coords[odin.coords$id==ids[1], c("lat", "lon")]
+  x.2 <- odin.coords[odin.coords$id==ids[2], c("lat", "lon")]
+  x.3 <- odin.coords[odin.coords$id==ids[3], c("lat", "lon")]
+  v.1 <- x.1 - x.2
+  v.2 <- x.3 - x.2
+  pi - acos( sum(v.1 * v.2) / sqrt(sum(v.1 * v.1)) / sqrt(sum(v.2 * v.2)) )
+}
+
+get.best.lines <- function(ids) {
+  # Determine which ODINs out of those in "ids" come closest to
+  # forming a straight line
+  best.lines <- data.frame(id.1=NA, id.2=NA, id.3=NA, angle=NA)
+  row.i <- 1
+  for (i in 1:length(ids)) {
+    for (j in 1:length(ids)) {
+      if (i==j) next
+      for (k in 1:length(ids)) {
+        if (k<=i) next
+        if (k==j) next
+        these.ids <- ids[c(i,j,k)]
+        best.lines[row.i, 1:3] <- these.ids
+        best.lines[row.i, 4] <- test.linearity(these.ids)
+        row.i <- row.i + 1
+      }
+    }
+  }
+  best.lines[order(best.lines$angle), ]
+}
+
+linear.interpolate <- function(x.1, y.1, x.2, y.2, x) {
+  y.1 + (x - x.1) * (y.2 - y.1) / (x.2 - x.1)
+}
+
+linterpolate.odins <- function(ids, y.1, y.3) {
+  x.1 <- odin.coords[odin.coords$id==ids[1], c("lat", "lon")]
+  x.2 <- odin.coords[odin.coords$id==ids[2], c("lat", "lon")]
+  x.3 <- odin.coords[odin.coords$id==ids[3], c("lat", "lon")]
+  v.1 <- x.1 - x.2
+  v.2 <- x.3 - x.2
+  d.1 <- sqrt(sum(v.1 * v.1))
+  d.2 <- sqrt(sum(v.2 * v.2))
+  linear.interpolate(0, y.1, d.1+d.2, y.3, d.1)
+}
+
+linear.experiment <- function(ids, data) {
+  results <- get.best.lines(ids)
+  results <- results[results$angle < 0.5, ]
+  results
+  results[, c('mae', 'mrae', 'mse')] <- 0
+  for (i in 1:nrow(results)) {
+    these.ids <- as.numeric(results[i, 1:3])
+    y.1 <- data[, paste0('odin.',these.ids[1],'.pm10')]
+    y.2 <- data[, paste0('odin.',these.ids[2],'.pm10')]
+    y.3 <- data[, paste0('odin.',these.ids[3],'.pm10')]
+    y.hat <- linterpolate.odins(these.ids, y.1, y.3)
+    results[i, 5:7] <- calculate.errors(y.2, y.hat)
+  }
+  # Get the mean per column
+  results[nrow(results)+1, ] <- colMeans(results)
+  results[nrow(results), 1:3] <- NA
+  # Get the SD per column
+  results[nrow(results)+1, ] <- NA
+  for (i in 5:ncol(results)) {
+    results[nrow(results), i] <- sd(results[1:(nrow(results)-2), i]) # should be population sd but oh well
+  }
+  results
+}
+
+linear.experiment(ex.odin.ids, ex.data.cal)
+linear.experiment(in.odin.ids, in.data.cal)
+```
+
+## What can we do with Delaunay triangulation?
+
+```{r delaunay}
+# have a peep at delauney triangulation
+draw.map <- function(ids) {
+  # Print a map illustrating the geographic location of each of a set of points
+  # Note: this function only works one in ten times
+  
+  # Compile lats and longs
+  points <- odin.coords[as.character(ids), ]
+  points$ids <- as.character(ids)
+  
+  # Unlabelled map
+  map <- get_map(location = c(mean(points$lon), mean(points$lat)), zoom = 14, maptype="satellite")
+  
+  # Labelled map
+  map.lab <- ggmap(map) +
+    geom_point(data=points, aes(x=lon, y=lat), col="red", size=1) +
+    geom_shadowtext(data=points, aes(label=ids), hjust=0, vjust=0, size=4) +
+    xlab("Longitude") +
+    ylab("Latitude")
+  
+  map.lab
+}
+
+draw.delaunay <- function(ids, exclude.ids) {
+  # Draw a map of a Delaunay triagulation where ids are all the points to be drawn
+  # and exclude.ids are the points which will be interpolated and thus excluded from the triangulation
+  points <- odin.coords[as.character(setdiff(ids, exclude.ids)), ]
+  voronoi <- deldir(points$lon, points$lat)$delsgs
+  
+  # Delaunay triangulation
+  plt <- draw.map(ids) +
+    geom_segment(data=voronoi, aes(x=x1, y=y1, xend=x2, yend=y2)) + 
+    theme(axis.text.x=element_blank(), axis.text.y=element_blank(),
+          axis.ticks.x=element_blank(), axis.ticks.y=element_blank())
+  
+  plt
+}
+
+draw.delaunay(wide.odin.ids, c(113,109,106))
+```
+
+## Finding Triangles
+
+```{r SF}
+which.side.of.line <- function(p, p1, p2) {
+  # Returns a positive or negative number depending on which side of the line
+  # which passes through p1 and p2 p falls on.
+  (p$x - p2$x) * (p1$y - p2$y) - (p1$x - p2$x) * (p$y - p2$y);
+}
+
+is.inside.triangle <- function(ps) {
+  # Where you are testing if the last point in ps is enclosed by the first 3 points
+  temp <- ps[[1]] # I implemented this the wrong way around
+  ps[[1]] <- ps[[4]]
+  ps[[4]] <- temp
+  b1 <- which.side.of.line(ps[[1]], ps[[2]], ps[[3]]) < 0;
+  b2 <- which.side.of.line(ps[[1]], ps[[3]], ps[[4]]) < 0;
+  b3 <- which.side.of.line(ps[[1]], ps[[4]], ps[[2]]) < 0;
+
+  ((b1 == b2) && (b2 == b3))
+}
+
+get.ps <- function(ids, include.w=FALSE, line=NULL) {
+  # Turn a vector of ids into a list of lists of the form list(id, x, y)
+  # This is just to make the geometric formulas more readable (p$x is better than p['x'] or p[1])
+  ps <- list()
+  for (id in ids) {
+    if (include.w) {
+      w <- line[paste('odin',id,'pm10',sep='.')]
+      p <- list(id=id, x=get.lon(id), y=get.lat(id), w=w)
+    } else {
+      p <- list(id=id, x=get.lon(id), y=get.lat(id))
+    }
+    ps[[length(ps)+1]] <- p 
+  }
+  ps
+}
+
+get.triangles <- function(ids) {
+  # Determine which ODINs out of those in "ids" form triangles 
+  results <- data.frame(id.1=0, id.2=0, id.3=0, id.4=0)
+  row.i <- 1
+  for (i in 1:length(ids)) {
+    id.1 <- ids[i]
+    for (j in 1:length(ids)) {
+      if (i>=j) next
+      id.2 <- ids[j]
+      for (k in 1:length(ids)) {
+        if (j>=k) next
+        id.3 <- ids[k]
+        for (l in 1:length(ids)) {
+          if (l==i) next
+          if (l==j) next
+          if (l==k) next
+          id.4 <- ids[l]
+          ps <- get.ps( c(id.1, id.2, id.3, id.4) )
+          if (is.inside.triangle(ps)) {
+            results[row.i, 1:4] <- c(id.1, id.2, id.3, id.4)
+            row.i <- row.i + 1
+          }
+        }
+      }
+    }
+  }
+  results
+}
+
+triangles <- get.triangles(wide.odin.ids)
+print(triangles)
+print(xtable(triangles))
+```
+
+## Interpolation Methods
+
+```{r methods}
+# All methods should take a list of "point" objects as input and interpolate 
+# the last point from the preceding three.
+
+# K-Nearest Neighbour
+
+get.distance.1 <- function(x1, y1, x2, y2) {
+  sqrt( (x1-x2)^2 + (y1-y2)^2 )
+}
+
+get.distance.2 <- function(p1, p2) {
+  get.distance.1(p1$x, p1$y, p2$x, p2$y)
+}
+
+knn.interpolate <- function(ps) {
+  distances <- c(0,0,0)
+  for (i in 1:3) {
+    distances[i] <- get.distance.2(ps[[i]], ps[[4]])
+  }
+  nn <- ps[[ which.min(distances) ]] # nearest neighbour
+  nn$w
+}
+
+# Bilinear
+
+project <- function(v1, v2) {
+  # Get the length of the projection of v1 onto v2
+  # Where v1, v2 are vectors c(x,y)
+  e2 <- v2 / sqrt( sum(v2*v2) ) # unit vector with direction of v2
+  sum(v1 * e2)
+}
+
+bilinear.interpolate <- function(ps) {
+  vecs <- list()
+  for (i in 1:4) {
+    vecs[[length(vecs)+1]] <- c(ps[[i]]$x, ps[[i]]$y)
+  }
+  result <- ps[[1]]$w 
+  result <- result + (ps[[2]]$w-ps[[1]]$w) * project(vecs[[4]] - vecs[[1]], vecs[[2]] - vecs[[1]])
+  result <- result + (ps[[3]]$w-ps[[1]]$w) * project(vecs[[4]] - vecs[[1]], vecs[[3]] - vecs[[1]])
+  result
+}
+
+# Shape function
+get.triangle.area <- function(p1, p2, p3) {
+  abs(det(matrix(c(p1$x, p2$x, p3$x, p1$y, p2$y, p3$y, 1, 1, 1), nrow=3, ncol=3)))/2
+}
+
+sf.interpolate <- function(ps) {
+  num <- 0
+  den <- 0
+  for (i in 2:4) {
+    V.i <- do.call(get.triangle.area, as.list(ps[-i]) )
+    num <- num + V.i * ps[[i]]$w
+    den <- den + V.i
+  }
+  num / den
+}
+
+# Kriging
+
+get.variogram <- function(data, ids) {
+  # Build a variogram based on the first time-slice of the data
+  data <- data[1, paste('odin',ids,'pm10',sep='.')]
+  names(data) <- as.character(ids)
+  data <- melt(data)
+  data$x <- odin.coords[data$variable, 'lon']
+  data$y <- odin.coords[data$variable, 'lat']
+  names(data) <- c('var', 'w', 'x', 'y')
+  coordinates(data) <- ~ x + y
+  var <- variogram(w ~ 1, data)
+  variogram <- fit.variogram(var, model=vgm(model="Sph"))
+  print(plot(var, variogram))
+  variogram
+}
+
+krige.interpolate <- function(ps) {
+  # variogram is presumed to be a global variable
+  data <- data.frame(w=0, x=0, y=0)
+  for (i in 1:3) {
+    data[i, 1:3] <- c(ps[[i]]$w, ps[[i]]$x, ps[[i]]$y)
+  }
+  coordinates(data) <- ~ x + y
+  
+  target <- data.frame(x=ps[[4]]$x, y=ps[[4]]$y)
+  coordinates(target) <- ~ x + y
+  
+  krige(w ~ 1, data, target, model=variogram)[[1]]
+}
+```
+
+##  Calculating Errors
+
+```{r krigging, message=F, warning=F}
+test.interpolation <- function(data, interpolation, triangles) {
+  # Test one particular interpolation technique across all the triangles
+  
+  rows <- c(as.character(1:nrow(triangles)), 'Mean')
+  results <- get.err.df(rows)
+  
+  for (i in 1:nrow(triangles)) {
+    cat('=')
+    triangle <- triangles[i, ]
+    y.hat <- c()
+    y <- c()
+    for (j in 1:nrow(data)) {
+      line <- data[j, ]
+      ps <- get.ps(triangle, include.w=TRUE, line)
+      y.hat <- c(y.hat, interpolation(ps))
+      y <- c(y, ps[[4]]$w)
+    }
+    results[i, ] <- calculate.errors(unlist(y), unlist(y.hat))
+  }
+  cat('\n')
+  
+  # Calculate means and sds
+  for (i in 1:(ncol(results)/2)) {
+    results[nrow(results), i*2-1] <- mean(results[1:(nrow(results)-1), i*2-1], na.rm=TRUE)
+    results[nrow(results), i*2] <- sd(results[1:(nrow(results)-1), i*2-1], na.rm=TRUE)
+  }
+  
+  results
+}
+
+
+test.interpolations <- function(data, ids, triangles) {
+  interpolations <- list(knn.interpolate, bilinear.interpolate, sf.interpolate, krige.interpolate)
+  names(interpolations) <- c('KNN', 'Bilinear', 'SF', 'Kriging')
+  results <- get.err.df(names(interpolations))
+  all.results <- list()
+  cat('\n')
+  cat(paste(rep('=',64), collapse=''))
+  cat('\n')
+  for (i in 1:length(interpolations)) {
+    cat(paste('Doing',names(interpolations)[i],'interpolation\n'))
+    these.results <- test.interpolation(data, interpolations[[i]], triangles)
+    all.results[[length(all.results)+1]] <- these.results
+    results[i, ] <- these.results[nrow(these.results), ]
+  }
+  save(all.results, file="all_results.rda")
+  results
+}
+
+variogram <- get.variogram(calibrated.data, wide.odin.ids)
+triangles <- get.triangles(wide.odin.ids)
+
+test.interpolations(calibrated.data, wide.odin.ids, triangles)
+```
+
+```{r wind_and_distance}
+load(file="all_results.rda")
+sf.errs <- all.results[[3]]
+
+for (i in 1:nrow(triangles)) {
+  print(i)
+  ps <- get.ps(triangles[i, ])
+  sf.errs[i, 'Area'] <- get.triangle.area(ps[[1]], ps[[2]], ps[[3]])
+}
+
+# Area is currently in degrees^2
+# Convert to km^2:
+sa.km <- 510072000 # surface area of earth in km^2
+sa.deg <- 360^2 / pi # surface area of earth in degrees^2
+sf.errs$Area <- sf.errs$Area * sa.km / sa.deg
+
+ggplot(sf.errs) +
+  geom_point(aes(Area, RMSE)) +
+  labs(title="Area vs RMSE", x='Area (m^2)', y='RMSE') +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  expand_limits(y=0, x=0)
+
+test <- function() {
+  for (i in 1:3) {
+    cat('hello\n')
+    for (j in 1:5)
+      cat('+')
+    cat('\n')
+  }
+}
+```

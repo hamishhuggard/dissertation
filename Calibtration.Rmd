@@ -1,0 +1,289 @@
+---
+title: "calibration"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+library('corrplot')
+library("ggplot2")
+library('xtable')
+library('caret')
+library('MASS')
+library('reshape2')
+library('gridExtra')
+
+setwd("Desktop/repo/The Good Code for Reals")
+load(file="calc_errs.rda")
+load(file="odin_data.rda")
+```
+
+## Correlation between PM Measurements
+
+```{r correlations}
+mean.ecan.cors <- data.frame()
+mean.ecan.cors[1:3, '101'] <- c(0,0,0)
+row.names(mean.ecan.cors) <- c('PM2.5', 'PM10', 'Diff.')
+for (col.name in paste0(wide.odin.ids)) {
+  mean.ecan.cors[1, col.name] <- 0
+}
+
+for (i in 1:2) {
+  pm <- c('pm2.5','pm10')[i]
+  print(paste("Correlations for", pm))
+  
+  # Get data for this PM channel
+  pm.data <- wide.coloc[, paste0('odin.', wide.odin.ids, '.', pm)]
+  pm.data$pm10 <- wide.coloc[, pm]
+  names(pm.data) <- c(paste0('ODIN-',wide.odin.ids), "ECan")
+  pm.data <- pm.data[complete.cases(pm.data), ]
+  
+  # Get and plot correlation matrix
+  pm.corr <- cor(pm.data)
+  corrplot(pm.corr, method="circle")
+  dev.print(png, paste0("figs/",pm,"_correlation.png"), width=800)
+  print(pm.corr[1:(nrow(pm.corr)-1), 'ECan'])
+  
+  # Look specifically at correlation with ECan
+  mean.ecan.cors[i, paste0(wide.odin.ids)] <- pm.corr[1:(nrow(pm.corr)-1), 'ECan']
+  mean.ecan.cors[i, 'Avg.'] <- mean(pm.corr[1:(nrow(pm.corr)-1), 'ECan'])
+}
+
+mean.ecan.cors[3, 2:ncol(mean.ecan.cors)] <- mean.ecan.cors[1, 2:ncol(mean.ecan.cors)] - mean.ecan.cors[2, 2:ncol(mean.ecan.cors)]
+
+mean.ecan.cors
+xtable(mean.ecan.cors)
+```
+
+## Synchronizing Clocks
+
+```{r offsets}
+# For plotting
+g_legend<-function(a.gplot){
+  tmp <- ggplot_gtable(ggplot_build(a.gplot))
+  leg <- which(sapply(tmp$grobs, function(x) x$name) == "guide-box")
+  legend <- tmp$grobs[[leg]]
+  return(legend)}
+
+try.offsets <- function(data, odin.ids) {
+  
+  best.offsets <- data.frame(odin.ids=0, pm2.5=0, pm10=0, temp=0)
+  offset.cors <- data.frame(offset=0, pm2.5=0, pm10=0, temp=0)
+  offset.range <- -120:120
+  best.offsets[1:length(odin.ids), 'odin.ids'] <- odin.ids
+  vars <- c('pm2.5', 'pm10', 'temp')
+  ecan.measurements <- data[, c('date', 'pm2.5', 'pm10')]
+  ecan.measurements[1:nrow(wide.coloc), 'temp'] <- wide.coloc$temp.2m
+  
+  plts <- list()
+  for (j in 1:length(odin.ids)) {
+    id <- odin.ids[j]
+    offset.cors.this <- offset.cors
+    odin.measurements <- data[, c('date', paste('odin',id, vars, sep='.'))]
+    for (i in 1:length(offset.range)) {
+      offset <- offset.range[i]
+      odin.measurements.this <- odin.measurements
+      odin.measurements.this$date <- odin.measurements.this$date + offset * 60
+      ecan.measurements.this <- ecan.measurements
+      # print('ecan')
+      # print(names(ecan.measurements))
+      # print('odin')
+      # print(names(odin.measurements))
+      this.alignment <- merge(ecan.measurements.this, odin.measurements.this, by='date', all=FALSE)
+      for (var in vars) {
+        # print('has')
+        # print(names(this.alignment))
+        # print('wants')
+        # print(paste('odin',id,var,sep='.'))
+        offset.cors.this[i, var] <- cor(this.alignment[, var], this.alignment[, paste('odin',id,var,sep='.')])
+      }
+      offset.cors.this[i, 'offset'] <- offset
+    }
+    
+    # Plot this
+    offset.cors.this.plt <- offset.cors.this
+    names(offset.cors.this.plt) <- c('offset', 'PM2.5', 'PM10', 'Temperture')
+    offset.cors.melt <- melt(offset.cors.this.plt, id.vars=c('offset'))
+    plt <- ggplot(offset.cors.melt, aes(offset/60, value, colour=variable, group=variable)) +
+      geom_point() +
+      geom_line() +
+      labs(title=paste0('ODIN-',id), x='Offset (h)', y='Pearson Correlation', colour="Measurement") +
+      theme(plot.title = element_text(hjust = 0.5))# + theme(legend.position="bottom")
+    legend <- g_legend(plt)
+    plt <- plt + theme(legend.position="none")
+    plts[[j]] <- plt
+    
+    # Record best offset
+    for (var in vars) {
+      best.offsets[j, var] <- offset.cors.this[which.max(offset.cors.this[, var]), 'offset']
+    }
+  }
+  plts[[length(plts)+1]] <- legend
+  
+  # Print the best offsets
+  row.names(best.offsets) <- as.character(odin.ids)
+  best.offsets$odin.ids <- NULL
+  print(best.offsets)
+  print(xtable(best.offsets))
+  
+  # Combine plots
+  n <- length(plts)
+  nCol <- floor(sqrt(n))
+  big.plt <- grid.arrange(grobs=plts, ncol=3, top="ODIN-ECan Synchronization Tests")
+  # grid.arrange(ggplotGrob(plts), nrow=3, )
+}
+
+try.offsets(wide.coloc, wide.odin.ids)
+```
+
+
+## Trying Different Callibration Models
+
+```{r callibration}
+n.folds <- 10
+
+get.blocks <- function(data, n.blocks) {
+  nums <- 1:nrow(data)
+  block.size <- floor(nrow(data)/n.blocks)
+  blocks <- list()
+  for (i in 1:n.blocks) {
+    blocks[[i]] <- ((i-1)*block.size+1):(i*block.size)
+  }
+  blocks
+}
+
+test.model <- function(data, id, inputs, poly.deg=1) {
+  inputs <- paste( paste('odin', id, inputs, sep='.'), collapse=', ')
+  eval(parse(text=paste('form <- pm10 ~ polym(', inputs, ', degree=', poly.deg, ')')))
+  folds <- get.blocks(data, 10) #createFolds(1:nrow(data), k=n.folds)
+  y.hat <- 0
+  y <- 0
+  for (i in 1:n.folds) { # This is not a bona-fide k-fold cross validation, but it's close enough
+    train.data <- data[-unlist(folds[i]), ]
+    model <- rlm(form, train.data)
+    y.hat <- c(y.hat, predict(model, data[unlist(folds[i]), ]))
+    y <- c(y, data[unlist(folds[i]), 'pm10'])
+  }
+  calculate.errors(y[2:length(y)], y.hat[2:length(y)])
+}
+
+
+test.model.across.odins <- function(data, ids, inputs, poly.deg=1) {
+  rows <- c(as.character(ids), "Mean")
+  results <- get.err.df(rows)
+  for (id in ids) {
+    results[as.character(id), ] <- test.model(data, id, inputs, poly.deg)
+  }
+  for (i in 1:(ncol(results)/2)) {
+    results[nrow(results), i*2-1] <- mean(results[1:(nrow(results)-1), i*2-1])
+    results[nrow(results), i*2] <- sd(results[1:(nrow(results)-1), i*2-1])
+  }
+  results
+}
+
+test.several.inputs <- function(data, ids, poly.deg=1) {
+  # Where models is a list of vectors of measurements
+  rows <- c("PM10", "PM10+RH", "PM10+T", "PM10+RH+T")
+  if (poly.deg>1) {
+    rows <- paste0( c(rows[1], paste0("(",rows[2:length(rows)],")")), "^", poly.deg )
+  }
+  results <- get.err.df(rows)
+  inputs.list <- list(c('pm10'), c('pm10','rh'), c('pm10','temp'), c('pm10','rh','temp'))
+  for (i in 1:length(rows)) {
+    inputs <- inputs.list[[i]]
+    new.results <- test.model.across.odins(data, ids, inputs, poly.deg)
+    results[i, ] <- new.results[nrow(new.results), ] # only record last line
+  }
+  results
+}
+
+test.several.polys <- function(data, ids, title) {
+  results <- get.err.df(c())
+  for (deg in 1:3) {
+    new.results <- test.several.inputs(data, ids, deg)
+    results <- rbind(results, new.results)
+  }
+  
+  print(results)
+  print(xtable(results))
+  
+  plot.results(results, title=title)
+}
+
+what.power.is.it <- function(string) {
+  last.char <- substr(string,nchar(string),nchar(string))
+  if (last.char == "3") return(3)
+  if (last.char == "2") return(2)
+  return(1)
+}
+
+strip.brackets <- function(string) {
+  if (substr(string,1,1)=="(")
+    return(substr(string,2,nchar(string)-3))
+  if (substr(string,nchar(string)-1,nchar(string)-1)=="^")
+    return(substr(string,1,nchar(string)-2))
+  string
+}
+
+plot.results <- function(results, title) {
+  plts <- list()
+  i <- 1
+  for (ME in c("RMSE","MRAE","MAQCE")) {
+    results.mean <- data.frame(Error=results[, ME], sd=results[, paste0(ME,'.sd')])
+    results.mean$variables <- row.names(results)
+    #results.mean <- melt(results.mean, id.vars=c("variables"))
+    #results.sd <- data.frame(RMSE=results$RMSE.sd, MRAE=results$MRAE.sd, MAQCE=results$MAQCE.sd)
+    #results.sd <- melt(results.sd)
+    #results.mean$sd <- results.sd$value
+    results.mean$order <- strtoi( lapply(results.mean$variables, what.power.is.it) )
+    results.mean$inputs <- as.character( lapply(results.mean$variables, strip.brackets) )
+    plt <- ggplot(results.mean, aes(x=order, y=Error, fill=inputs)) +
+      geom_bar(stat="identity", position=position_dodge()) +
+      geom_errorbar(aes(ymin=Error-sd,ymax=Error+sd,x=order), width=.2, position=position_dodge(.9)) +
+      labs(y=ME, x="Order Polynomial", fill="Input Variables") +
+      scale_fill_brewer(palette="Reds") +
+      theme(legend.position="bottom")
+    plts[[i]] <- plt
+    i <- i + 1
+  }
+  
+  plt.1 <- plts[[1]]
+  plt.2 <- plts[[2]]
+  plt.3 <- plts[[3]]
+  mylegend <- g_legend(plt.1)
+  grid.arrange(arrangeGrob(plt.1 + theme(legend.position="none"),
+                         plt.2 + theme(legend.position="none"),
+                         plt.3 + theme(legend.position="none"),
+                         nrow=1),
+             mylegend, nrow=2, heights=c(10, 1), top=title)
+}
+
+test.several.polys(wide.coloc, wide.odin.ids, "Model Errors for Wide Dataset")
+
+long.coloc <- rbind(long.init, long.fin)
+test.several.polys(long.coloc, long.odin.ids, "Model Errors for Long Dataset")
+```
+
+## Calibrate the wide dataset
+
+```{r calibrate_wide}
+calibrated.data <- data.frame(date=wide.deploy$date)
+
+for (id in wide.odin.ids) {
+  var <- paste('odin',id,'pm10',sep='.')
+  eval(parse(text=paste0('form <- pm10 ~ ', var)))
+  this.rlm <- rlm(form, wide.coloc)
+  calibrated.data[, var] <- predict(this.rlm, wide.deploy)
+}
+
+saveRDS(calibrated.data, "calibrated_data.rds")
+```

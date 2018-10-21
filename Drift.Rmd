@@ -1,0 +1,371 @@
+---
+title: "Drift"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r intro}
+library('corrplot')
+library("ggplot2")
+library('xtable')
+library('caret')
+library('MASS')
+library('reshape2')
+library('gridExtra')
+
+setwd("Desktop/repo/The Good Code for Reals")
+load(file="calc_errs.rda")
+load(file="odin_data.rda")
+```
+
+## Initial vs Final Parameters
+
+```{r parameters}
+examine.params <- function(init.data, fin.data, param.no, title, ylab, weights=NA) {
+  rows <- as.character(long.odin.ids)
+  cols <- c("Initial Colocation", "Init. err", "Final Colocation", "Fin. err", "Z-score", "p-value")
+  params <- data.frame(matrix(0, ncol=length(cols), nrow=length(rows)))
+  row.names(params) <- rows
+  names(params) <- cols
+  
+  for (i in 1:length(long.odin.ids)) {
+    id <- long.odin.ids[i]
+    eval(parse(text=paste0("form <- pm10 ~ odin.", id, ".pm10")))
+    
+    # Create models
+    if (!is.na(weights)) {
+      init.coefs <- summary(rlm(form, data=init.data, weights=weights[[1]]))$coefficients
+      fin.coefs <- summary(rlm(form, data=fin.data, weights=weights[[2]]))$coefficients
+    } else {
+      init.coefs <- summary(rlm(form, data=init.data))$coefficients
+      fin.coefs <- summary(rlm(form, data=fin.data))$coefficients
+    }  
+    
+    # Extract parameters
+    params[i, 1] <- init.coefs[param.no, 1]
+    params[i, 2] <- init.coefs[param.no, 2]
+    params[i, 3] <- fin.coefs[param.no, 1]
+    params[i, 4] <- fin.coefs[param.no, 2]
+    
+    # Calculate z-score and p-value
+    params[i, 5] <- (params[i, 3] - params[i, 1])/max(params[i, 2], params[i, 4])
+    params[i, 6] <- 2*pnorm(-abs(params[i, 5])) * 100
+  }
+  
+  print(params)
+  print(xtable(params))
+  
+  # Plot this
+  param.means <- params[, c(1, 3)]
+  param.means$serial <- row.names(params)
+  param.means <- melt(param.means, id=c("serial"))
+  
+  param.sd <- params[, c(2, 4)]
+  param.sd <- melt(param.sd)
+  param.means$sd <- param.sd$value
+  
+  plt <- ggplot(param.means) +
+    geom_point(aes(serial, value, colour=variable), position=position_dodge(.2)) +
+    geom_errorbar(aes(ymin=value-sd, ymax=value+sd, x=serial, colour=variable), position=position_dodge(.2)) +
+    labs(title=title, y=ylab, x="ODIN Serial", colour="") +
+    theme(legend.position="bottom")
+  plt
+}
+
+
+plt.1 <- examine.params(long.init, long.fin, 1, "", expression("Intercept ("*mu*g*m^-3*")"))
+plt.2 <- examine.params(long.init, long.fin, 2, "", expression(PM[2.5]^{(ODIN)}*" Coefficient"))
+
+g_legend<-function(a.gplot){
+  tmp <- ggplot_gtable(ggplot_build(a.gplot))
+  leg <- which(sapply(tmp$grobs, function(x) x$name) == "guide-box")
+  legend <- tmp$grobs[[leg]]
+  return(legend)}
+
+mylegend<-g_legend(plt.1)
+
+grid.arrange(arrangeGrob(plt.1 + theme(legend.position="none") + theme(legend.position="none"),
+                         plt.2 + theme(legend.position="none") + theme(legend.position="none"),
+                         nrow=1),
+             mylegend, nrow=2, heights=c(10, 1), top="Drift in the Long Dataset")
+```
+
+## Binning Technique
+
+```{r thing}
+calculate.weights <- function(data.1, data.2, var, no.bins=20) {
+  # Calculate the bins
+  lowest <- min(rbind(data.1, data.2)[, var], na.rm=TRUE)
+  highest <- max(rbind(data.1, data.2)[, var], na.rm=TRUE)
+  bin.breaks <- seq(lowest-1, highest+1, length.out=no.bins)
+  
+  # Put the data into the bins
+  bin.1 <- cut(data.1[, var], breaks=bin.breaks)
+  bin.2 <- cut(data.2[, var], breaks=bin.breaks)
+  
+  # The number of occurances in each bin
+  num.bin.1 <- summary(bin.1)
+  num.bin.2 <- summary(bin.2)
+  
+  # The density in the two bins
+  dist.1 <- num.bin.1 / sum(num.bin.1)
+  dist.2 <- num.bin.2 / sum(num.bin.2)
+  
+  # Calculate weights
+  weights.2 <- dist.1[bin.2]
+  weights.1 <- dist.2[bin.1]
+  
+  list(weights.1, weights.2)
+}
+
+generate.data <- function(relation, x.mean, x.sd, label="", noise.sd=0.1, sample.size=500) {
+  x <- rnorm(sample.size, x.mean, x.sd)
+  y <- unlist(lapply(x, relation))
+  y <- y + rnorm(sample.size, 0, noise.sd)
+  data.frame(x=x, y=y, label=rep(label, sample.size))
+}
+
+run.demo <- function(mean.1, mean.2, sd, sample.size, bins) {
+  relation <- function(x) sqrt(x+0.3)
+  data.1 <- generate.data(relation, mean.1, sd, sample.size=sample.size, label="D1")
+  data.2 <- generate.data(relation, mean.2, sd, sample.size=sample.size, label="D2")
+  weights <- calculate.weights(data.1, data.2, "y", bins)
+  
+  rlm.1 <- rlm(y~x, data=data.1, weights=weights[[1]])
+  rlm.2 <- rlm(y~x, data=data.2, weights=weights[[2]])
+  rlm.3 <- rlm(y~x, data=data.1)
+  rlm.4 <- rlm(y~x, data=data.2)
+  
+  plt.1 <- plot.coefs(rlm.1, rlm.2, rlm.3, rlm.4, 1, "Constant")
+  plt.2 <- plot.coefs(rlm.1, rlm.2, rlm.3, rlm.4, 2, "Gradient")
+  
+  plt.3 <- plot.data(relation, mean.1, mean.2, sd, data.1, data.2, rlm.3, rlm.4, "Original")
+  plt.4 <- plot.data(relation, mean.1, mean.2, sd, data.1, data.2, rlm.1, rlm.2, "Corrected", weights=c(weights[[1]],weights[[2]]))
+  
+  return(list(plt.1, plt.2, plt.3, plt.4))
+}
+
+plot.coefs <- function(rlm.1, rlm.2, rlm.3, rlm.4, param.no, ylab) {
+  rows <- c(1, 2)
+  cols <- c("D1", "D1 err", "D2", "D2 err", "Z-score", "p-value")
+  params <- data.frame(matrix(0, ncol=length(cols), nrow=length(rows)))
+  row.names(params) <- rows
+  names(params) <- cols
+  
+  for (i in 1:2) {
+    if (i==2) {
+      init.rlm <- rlm.1
+      fin.rlm <- rlm.2
+    } else {
+      init.rlm <- rlm.3
+      fin.rlm <- rlm.4
+    }
+    init.coefs <- summary(init.rlm)$coefficients
+    fin.coefs <- summary(fin.rlm)$coefficients
+    
+    # Extract parameters
+    params[i, 1] <- init.coefs[param.no, 1]
+    params[i, 2] <- init.coefs[param.no, 2]
+    params[i, 3] <- fin.coefs[param.no, 1]
+    params[i, 4] <- fin.coefs[param.no, 2]
+    
+    # Calculate z-score and p-value
+    params[i, 5] <- (params[i, 3] - params[i, 1])/max(params[i, 2], params[i, 4])
+    params[i, 6] <- 2*pnorm(-abs(params[i, 5])) * 100
+  }
+  
+  if (param.no==1) print("Constant")
+  else if (param.no==2) print("Gradient")
+  print(params)
+  print(xtable(params))
+  
+  # Plot this
+  param.means <- params[, c(1, 3)]
+  param.means$serial <- row.names(params)
+  param.means <- melt(param.means, id=c("serial"))
+  
+  param.sd <- params[, c(2, 4)]
+  param.sd <- melt(param.sd)
+  param.means$sd <- param.sd$value
+  
+  plt <- ggplot(param.means) +
+    geom_point(aes(serial, value, colour=variable), position=position_dodge(.2)) +
+    geom_errorbar(aes(ymin=value-sd, ymax=value+sd, x=serial, colour=variable), position=position_dodge(.2)) +
+    labs(y=ylab, x="", colour="") +
+    theme(legend.position="bottom") + 
+    scale_x_discrete(labels=c('Original', 'Corrected'))
+  
+  plt
+}
+
+plot.data <- function(rel, mean.1, mean.2, sd, data.1, data.2, rlm.1, rlm.2, title, weights=NA) {
+  # # Also plot the situation
+  data <- rbind(data.1, data.2)
+  
+  # Generate line data
+  line.2 <- data.frame(x=c(mean.2-2*sd,mean.2+2*sd))
+  line.2$y <- predict(rlm.2, newdata=line.2)
+  line.2$label <- c("D2", "D2")
+  line.1 <- data.frame(x=c(mean.1-2*sd,mean.1+2*sd))
+  line.1$y <- predict(rlm.1, newdata=line.1)
+  line.1$label <- c("D1", "D1")
+  line.data <- rbind(line.1, line.2)
+  
+  # Rel data
+  rel.data <- data.frame(x=seq(min(data$x), max(data$x), length.out=50))
+  rel.data$y <- rel(rel.data$x)
+  
+  plt <- ggplot() +
+    geom_point(data=data, aes(x, y, colour=label), alpha=0.1) +
+    geom_line(data=line.data, aes(x, y, colour=label), size=1) +
+    labs(y="y", x="x", colour="", title=title) +
+    theme(legend.position="bottom") +
+    geom_line(data=rel.data, aes(x, y), colour='black', linetype="dashed") +
+    theme(plot.title = element_text(hjust = 0.5))
+    
+  plt
+}
+
+plts <- run.demo(0.5, 1.5, 0.4, 500, 15)
+
+plt.1 <- plts[[1]]
+plt.2 <- plts[[2]]
+plt.3 <- plts[[3]]
+plt.4 <- plts[[4]]
+
+legend.1<-g_legend(plt.1)
+
+grid.arrange(arrangeGrob(plt.1 + theme(legend.position="none") + theme(legend.position="none"),
+                         plt.2 + theme(legend.position="none") + theme(legend.position="none"),
+                         nrow=1),
+             legend.1, nrow=2, heights=c(10, 1), top="Virtual Drift Correction Demonstration (Parameters)")
+
+grid.arrange(arrangeGrob(plt.3 + theme(legend.position="none") + theme(legend.position="none"),
+                         plt.4 + theme(legend.position="none") + theme(legend.position="none"),
+                         nrow=1),
+             legend.1, nrow=2, heights=c(10, 1), top="Virtual Drift Correction Demonstration")
+```
+
+## Initial vs Final Parameters Revisited
+
+```{r }
+weights <- calculate.weights(long.init, long.fin, "pm10", 20)
+plt.1 <- examine.params(long.init, long.fin, 1, "", expression("Intercept ("*mu*g*m^-3*")"), weights=weights)
+plt.2 <- examine.params(long.init, long.fin, 2, "", expression(PM[2.5]^{(ODIN)}*" Coefficient"), weights=weights)
+
+mylegend<-g_legend(plt.1)
+
+grid.arrange(arrangeGrob(plt.1 + theme(legend.position="none") + theme(legend.position="none"),
+                         plt.2 + theme(legend.position="none") + theme(legend.position="none"),
+                         nrow=1),
+             mylegend, nrow=2, heights=c(10, 1), top="Drift in the Long Dataset")
+```
+
+## Time Dependent Models
+
+```{r TDMs}
+form <- pm10 ~ odin.109.pm10
+data.init <- long.init
+data.final <- long.fin
+data <- long.deploy
+odin.vars <- c('odin.109.pm10')
+
+# Generate linear models
+init.lm <- rlm(form, data=data.init)
+final.lm <- rlm(form, data=data.final)
+both.lm <- rlm(form, data=rbind(data.init,data.final))
+
+# Extract coefficients
+init.coefs <- (summary(init.lm)$coefficients)[, "Value"]
+final.coefs <- (summary(final.lm)$coefficients)[, "Value"]
+both.coefs <- (summary(both.lm)$coefficients)[, "Value"]
+
+
+# Generate the initial model
+init.model <- function(line) {
+  # answer <- init.coefs['(Intercept)']
+  # for (var in odin.vars) {
+  #   answer <- answer + init.coefs[var] * line[var]
+  # }
+  # return(answer)
+  predict(init.lm, line)
+}
+
+# Generate the final model
+final.model <- function(line) {
+  predict(final.lm, line)
+  # answer <- final.coefs['(Intercept)']
+  # for (var in odin.vars) {
+  #   answer <- answer + final.coefs[var] * line[var]
+  # }
+  # return(answer)
+}
+
+# Generate a single model using both colocation periods
+both.model <- function(line) {
+  answer <- both.coefs['(Intercept)']
+  for (var in odin.vars) {
+    answer <- answer + both.coefs[var] * line[var]
+  }
+  return(answer)
+}
+
+# Create a time dependent weighted-average model
+data.start <- data$date[1]
+data.end <- data$date[nrow(data)]
+
+weighted.model <- function(line) {
+  init.y <- init.model(line)
+  final.y <- final.model(line)
+  # The proportion of the way through the duration of the experiment
+  prop <- as.numeric(line$date - data.start) / as.numeric(data.end - data.start)
+  init.y * (1-prop) + final.y * prop
+}
+
+# Create a time dependent parametric-interpolation model
+interpolate.coef <- function(line, var) {
+  x.0 <- data.start
+  x.1 <- data.end
+  x <- line$date
+  y.0 <- init.coefs[var]
+  y.1 <- final.coefs[var]
+  y.0 + as.numeric(x-x.0) * (y.1-y.0) / as.numeric(x.1 - x.0)
+}
+
+interpolation.model <- function(line) {
+  answer <- interpolate.coef(line, '(Intercept)')
+  for (var in odin.vars) {
+    answer <- answer + interpolate.coef(line, var) * line[var]
+  }
+  return(answer)
+}
+
+test.models <- function() {
+  
+  models <- list(init.model, final.model, both.model, 
+               weighted.model, interpolation.model)
+  names(models) <- c("Initial Model", "Final Model", "Both model", 
+                   "Weighted Average Model", "Parameter Interpolation Model")
+  results <- get.err.df(names(models))
+  
+  for (i in 1:length(models)) {
+    y.hat <- c(0)
+    y <- data[, 'pm10']
+    model <- models[[i]]
+    for (j in 1:nrow(data)) {
+      line <- data[j, ]
+      y.hat <- c(y.hat, as.numeric(model(line)))
+    }
+    y.hat <- as.vector(y.hat[2:length(y.hat)])
+    results[i, ] <- calculate.errors(y, y.hat)
+  }
+  results
+}
+
+results <- test.models()
+results
+xtable(results)
+```

@@ -1,0 +1,412 @@
+---
+title: "Database Retrievals"
+author: "Hamish Huggard"
+date: "10 August 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## Connect to the Database
+
+```{r connect message=FALSE}
+library(RPostgreSQL)
+library(reshape2)
+library(zoo)
+library(lubridate)
+library(xtable)
+library(ggmap)
+library(gridExtra)
+library(shadowtext)
+
+# Database login details (not in GitHub repo)
+access <- readRDS("access.rds")
+
+# Connect to database
+p <- dbDriver("PostgreSQL")
+con <- dbConnect(p,
+                 user=access$user,
+                 password=access$pwd,
+                 host='penap-data.dyndns.org',
+                 dbname='cona',
+                 port=5432)
+```
+
+## Deployed ODIN Coordinates
+                 
+```{r sites}
+# Retrieve coordinates corresponding to each site ID
+site.coords <- dbGetQuery(con,"SELECT fs.id,
+  ST_X(ST_TRANSFORM(fs.geom::geometry,4326)) as lon,
+  ST_Y(ST_TRANSFORM(fs.geom::geometry,4326)) as lat
+  FROM admin.fixedsites as fs
+  ORDER BY fs.id;")
+
+# Create a dataframe with the siteid and coordinates for each ODIN
+odin.coords<- data.frame(site.id = c(12, 11, 10, 17, 13, 1, 6, 15, 16, 18, 14, 3, 4, 9, 8, 2, 5, 7))
+row.names(odin.coords) <- unlist(lapply(100:117, toString))
+odin.coords[, c('lon', 'lat')] <- 0
+for (i in 1:18) {
+  odin.coords[i, 2:3] <- site.coords[which(site.coords$id == odin.coords[i, 'site.id']), 2:3]
+}
+
+get.lon <- function(id) {
+  odin.coords[as.character(id), 'lon']
+}
+
+get.lat <- function(id) {
+  odin.coords[as.character(id), 'lat']
+}
+```
+
+## ECan Measurements
+
+```{r ecan}
+# Load ECan data from CSV file
+ecan <- read.csv('RangioraWinter2016.csv',stringsAsFactors=FALSE)
+
+names(ecan) <- c('date','time','wind.speed','wind.dir','wind.dir.std','wind.speed.std',
+                 'wind.max','co','temp.ground','temp.2m','temp.6m','pm10',
+                 'pm2.5','pm.course')
+
+# Parse dates
+ecan$date <- as.POSIXct(ecan$date,format = '%m/%d/%Y %H:%M', tz='Etc/GMT-12')
+ecan$time <- NULL
+```
+
+## ODIN Measurements
+
+```{r odin}
+# Load ODIN measurements of temperature, relative humidity, PM2.5 and PM10 
+# from the database
+
+# Note that measurements taken between 02:01 and 02:59 on 2016-09-25 are 
+# excluded from the query. This hour does not exist due to daylight savings
+# and when the exclusion clause is omitted the query breaks.
+
+odin.raw <-dbGetQuery(con,"SELECT d.recordtime AT TIME ZONE 'NZST' AS date,
+                            d.siteid as site,
+                            i.serialn as serial, s.name as label,
+                            d.value::numeric as val
+                           FROM data.fixed_data as d,  
+                            admin.sensor as s, admin.instrument as i
+                           WHERE s.id = d.sensorid
+                            AND s.instrumentid = i.id
+                            AND i.name = 'ODIN-SD-3'
+                            AND ((d.recordtime BETWEEN '2016-01-01 00:00 NZST'
+                              AND '2017-01-01 00:00 NZST')
+                             OR (d.recordtime BETWEEN '2016-10-03 00:00 NZST'
+                              AND '2016-10-19 00:00 NZST'))
+                            AND NOT (d.recordtime BETWEEN '2016-09-25 02:00 NZST'
+                             AND '2016-09-25 03:00 NZST')
+                            AND (s.name = 'PM2.5'
+                             OR s.name = 'PM10'
+                             OR s.name = 'Temperature'
+                             OR s.name = 'RH')
+                           ORDER BY date;") 
+
+# The "second" fields of the timestamps do not all align across ODINs. Because we will  
+# be averaging measurements over hour windows later, differences in measurement times 
+# of less than a minute will be inconsequential. We thus strip the "second" field
+# of the timestamps to make aligning the data easier.
+
+odin.raw$date <- trunc(odin.raw$date,'min')
+odin.raw$date <- as.POSIXct(odin.raw$date) # The above converted it to POSIXlt
+
+# When I do the following the data seems more sensible.
+# See https://rpubs.com/hamishhuggard/ds_bug3
+ds.time <- as.POSIXct('09/25/2016 02:00',format = '%m/%d/%Y %H:%M', tz='Etc/GMT-12')
+odin.raw[odin.raw$date > ds.time, 'date'] <- 
+  odin.raw[odin.raw$date > ds.time, 'date'] + 60*60
+```
+
+## Combine ECan and ODIN
+
+```{r ecan_odin}
+# All measurements will merge into this dataframe
+all.data <- ecan
+
+serials <- unique(odin.raw$serial)
+
+for (serial.i in serials) {
+  # Get the measurements from the ODIN with serial = serial.i
+  odin.i <- odin.raw[which(odin.raw$serial == serial.i), ]
+  odin.i <- dcast(odin.i, date + site ~ label, value.var = 'val', 
+                  fun.aggregate = mean)
+  
+  # Rename columns
+  names(odin.i) <- tolower(names(odin.i))
+  names(odin.i)[which(names(odin.i)=="temperature")] <- "temp"
+  names(odin.i) <- c('date', paste0('odin.', substring(serial.i, 6, 8), '.',
+                                    names(odin.i)[2:ncol(odin.i)]))
+  
+  # Fill in gaps in dates
+  start.date <- odin.i$date[1]
+  end.date <- odin.i$date[nrow(odin.i)]
+  all.dates <- data.frame(date=seq(start.date, end.date, by='mins'))
+  odin.i <- merge(odin.i, all.dates, by="date", all=TRUE)
+  
+  # Change the ODIN measurements from 1 min averages to 1 hour averages
+  odin.zoo <- zoo( odin.i[, 2:ncol(odin.i)] )
+  odin.roll.apply <- rollapply(odin.zoo, width=60, by=1, FUN=mean, align="left")
+  odin.i <- odin.i[1:nrow(odin.roll.apply), ]
+  odin.i[, 2:ncol(odin.i)] <- odin.roll.apply
+  
+  # Take timestamps at the end of the hour average following ECan convention
+  odin.i$date <- odin.i$date + 60*60
+  
+  all.data <- merge(all.data, odin.i, by='date', all=TRUE) 
+}
+
+# Save all the data
+saveRDS(all.data, "all_data.rds")
+```
+
+## Error Functions
+
+```{r err}
+AQC <- function(x) {
+  # Classify whether or not the air quality exceeds NZ standards
+  return(x >= 50)
+}
+
+calculate.errors <- function(y, y.hat) {
+  SE <- (y-y.hat)^2
+  MSE <- mean(SE)
+  RMSE <- sqrt(MSE)
+  RMSE.sd <- sd(SE) * RMSE / MSE
+  
+  RAE <- abs(y-y.hat)/y * 100
+  MRAE <- mean(RAE)
+  MRAE.sd <- sd(RAE)
+  
+  AQCE <- abs(AQC(y)-AQC(y.hat)) * 100
+  MAQCE <- mean(AQCE)
+  MAQCE.sd <- sd(AQCE)
+  
+  c(RMSE, RMSE.sd, MRAE, MRAE.sd, MAQCE, MAQCE.sd)
+}
+
+get.err.df <- function(rows=c()) {
+  # Returns an empty dataframe for storing errors in
+  results <- data.frame(matrix(0, nrow=length(rows), ncol=6))
+  names(results) <- c("RMSE", "RMSE.sd", "MRAE", "MRAE.sd", "MAQCE", "MAQCE.sd")
+  row.names(results) <- rows
+  results
+}
+```
+
+## Sanitize Data
+
+Here the data is sanitized so that only complete sets of measurements are included. The set of measurements is divided into two datasets: a wide (as in, it includes more ODINs) dataset which includes deployment and a final colocation period, and a long dataset which includes an initial colocation, deployment, and a final colocation.
+
+```{r sanitize}
+max.date <- as.POSIXct('2016-11-01 01:00', format='%Y-%m-%d %H:%M', tz='Etc/GMT-12')
+
+get.subset <- function(ids) {
+  # Get a subset of the data, only including ODINs with specific ids
+  # Only include complete cases of the data
+  data.subset <- all.data[, 1:13]
+  for (var in c('site', 'rh', 'temp', 'pm10', 'pm2.5')) {
+    for (id in ids) {
+      col.name <- paste0('odin.', id, '.', var)
+      data.subset[, col.name] <- all.data[, col.name]
+    }
+  }
+  data.subset <- subset(data.subset, date<max.date)
+  
+  data.subset[complete.cases(data.subset), ]
+}
+
+get.deployed <- function(data, ids) {
+  # From a dataset, extract the subset where every odin is deployed
+  for (id in ids) {
+    eval(parse(text=paste0('data <- subset(data, odin.',id,'.site == ', odin.coords[toString(id), 'site.id'], ')')))
+  }
+  data
+}
+
+get.coloc <- function(data, ids) {
+  # From a dataset, extract the subset where every odin is deployed
+  for (id in ids) {
+    eval(parse(text=paste0('data <- subset(data, odin.',id,'.site == 18)')))
+  }
+  data
+}
+
+# These are the ids of the ODINs which will be included in the wide and long datasets
+long.odin.ids <- c(102, 105, 107, 108, 109, 113)#, 115)
+wide.odin.ids <- c(101, 102, 104, 105, 106, 107, 108, 109, 113, 115)
+
+# wide dataset
+
+wide.data <- get.subset( wide.odin.ids )
+
+wide.deploy <- get.deployed(wide.data, wide.odin.ids)
+wide.coloc <- get.coloc(wide.data, wide.odin.ids)
+
+# long dataset
+
+long.data <- get.subset( long.odin.ids )
+
+mid.point <- as.POSIXct('2016-09-01 12:00', format='%Y-%m-%d %H:%M', tz='Etc/GMT-12')
+long.coloc <- get.coloc(long.data, long.odin.ids)
+long.init <- subset(long.coloc, date < mid.point)
+long.fin <- subset(long.coloc, date > mid.point)
+long.fin <- long.fin[1:nrow(long.init), ] # make them the same length
+long.deploy <- get.deployed(long.data, long.odin.ids)
+
+# Save all this
+
+save(calculate.errors, AQC, get.err.df, odin.coords, long.odin.ids, wide.odin.ids, wide.deploy, 
+     wide.coloc, long.init, long.fin, long.deploy, get.lon, get.lat, file="odin_data.rda")
+```
+
+## Specs of Datasets
+
+```{r specs}
+data.specs <- function(data.list, rows) {
+  specs <- data.frame()
+  for (i in 1:length(data.list)) {
+    data <- data.list[[i]]
+    specs[i, "No. Points"] <- nrow(data)
+    specs[i, "Start date"] <-  as.character( min(data$date) )
+    specs[i, "Finish date"] <-  as.character( max(data$date) )
+  }
+  row.names(specs) <- rows
+  print(specs)
+  print(xtable(specs))
+}
+
+# Dataset specs
+wide.specs <- data.specs(list(wide.deploy, wide.coloc), rows=c("Deployment", "Colocation"))
+wide.specs <- data.specs(list(long.init, long.deploy, long.fin), rows=c("Initial Colocation", "Deployment", "Final Colocation"))
+```
+
+## Make Maps
+
+```{r maps1}
+draw.map <- function(ids) {
+  # Print a map illustrating the geographic location of each of a set of points
+  # Note: this function only works one in ten times
+  
+  # Compile lats and longs
+  points <- odin.coords[as.character(ids), ]
+  points$ids <- as.character(ids)
+  
+  # Unlabelled map
+  map <- get_map(location = c(mean(points$lon), mean(points$lat)), zoom = 14, maptype="satellite")
+  
+  # Labelled map
+  map.lab <- ggmap(map) +
+    geom_point(data=points, aes(x=lon, y=lat), col="red", size=1) +
+    geom_shadowtext(data=points, aes(label=ids), hjust=0, vjust=0, size=4) +
+    xlab("Longitude") +
+    ylab("Latitude")
+  
+  map.lab
+}
+
+map0 <- draw.map(100:115)
+map0
+```
+
+```{r maps2}
+# These are temperamental:
+map1 <- draw.map(wide.odin.ids)
+map2 <- draw.map(long.odin.ids)
+
+grid.arrange(arrangeGrob(map1 + labs(x="", y="") + theme(axis.text.x=element_blank(), axis.text.y=element_blank(),
+                                                         axis.ticks.x=element_blank(), axis.ticks.y=element_blank()) +
+                           ggtitle("Wide Dataset") + theme(plot.title = element_text(hjust = 0.5)), 
+                         map2 + labs(x="", y="") + theme(axis.text.x=element_blank(), axis.text.y=element_blank(),
+                                                         axis.ticks.x=element_blank(), axis.ticks.y=element_blank()) +
+                           ggtitle("Long Dataset") + theme(plot.title = element_text(hjust = 0.5)),
+                         nrow=1),
+             nrow=2,heights=c(10, 1))
+```
+
+## Make Timelines
+
+```{r timeline1}
+xlabmin <- as.POSIXct("2016-07-01 0:0", format='%Y-%m-%d %H:%M', tz='Etc/GMT-12')
+xlabmax <- as.POSIXct("2016-11-01 0:0", format='%Y-%m-%d %H:%M', tz='Etc/GMT-12')
+
+draw.timeline <- function(coloc.data=NA, deploy.data=NA, ids=100:117, title="Timeline", all=FALSE) {
+  df.0 <- data.frame(date=as.POSIXct(NA), id=factor(NA, levels=as.character(100:117)), 
+                   state=factor(NA, levels=c('Deployed', 'Colocated')))
+  df <- df.0
+  for (id in ids) {
+    if (all) {
+          site.id <- odin.coords[as.character(id), 'site.id']
+          eval(parse(text=paste0("deploy.data <- subset(all.data, odin.", id, ".site == ", site.id, ")")))
+          eval(parse(text=paste0("coloc.data <- subset(all.data, odin.", id, ".site == 18)")))
+    }
+    
+    # Colocation dates
+    if (nrow(coloc.data)>0) {
+      df.2 <- df.0
+      df.2[1:nrow(coloc.data), 'date'] <- coloc.data$date
+      df.2[1:nrow(coloc.data), 'id'] <- rep(as.character(id), nrow(coloc.data))
+      df.2[1:nrow(coloc.data), 'state'] <- rep("Colocated", nrow(coloc.data))
+      df <- rbind(df, df.2)
+    }
+    
+    # Deployment dates
+    if (nrow(coloc.data)>0) {
+      df.2 <- df.0
+      df.2[1:nrow(deploy.data), 'date'] <- deploy.data$date
+      df.2[1:nrow(deploy.data), 'id'] <- rep(as.character(id), nrow(deploy.data))
+      df.2[1:nrow(deploy.data), 'state'] <- rep("Deployed", nrow(deploy.data))
+      df <- rbind(df, df.2)
+    }
+
+  }
+  
+  # Make sure all the IDs are included
+  for (id in 100:117) {
+    df.2 <- df.0
+    df.2[1:18, 'date'] <- rep(as.POSIXct("2018-07-01 0:0", format='%Y-%m-%d %H:%M', tz='Etc/GMT-12'), 18)
+    df.2[1:18, 'id'] <- as.character(100:117)
+    df.2[1:18, 'state'] <- rep("Deployed", 18)
+    df <- rbind(df, df.2)
+  }
+  
+
+  df <- df[2:nrow(df), ]
+  
+  plt <- ggplot(df) +
+    geom_point(aes(x=date, y=id, colour=state)) +
+    labs(title=title, y="ODIN Serial", x="Date", colour="") +
+    xlim(xlabmin, xlabmax) +
+    theme(legend.position="bottom")
+  
+  plt
+}
+
+all.data <- draw.timeline(all=TRUE, title="Timeline of All Data")
+
+all.data + theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r timeline2}
+p1 <- draw.timeline(wide.coloc, wide.deploy, wide.odin.ids, "Wide Dataset")
+p2 <- draw.timeline(rbind(long.init, long.fin), long.deploy, long.odin.ids, "Long Dataset")
+
+g_legend<-function(a.gplot){
+  tmp <- ggplot_gtable(ggplot_build(a.gplot))
+  leg <- which(sapply(tmp$grobs, function(x) x$name) == "guide-box")
+  legend <- tmp$grobs[[leg]]
+  return(legend)}
+
+mylegend<-g_legend(p1)
+
+grid.arrange(arrangeGrob(p1 + theme(legend.position="none") + theme(plot.title = element_text(hjust = 0.5)),
+                         p2 + theme(legend.position="none") + ylab("") + theme(plot.title = element_text(hjust = 0.5)),
+                         nrow=1),
+             mylegend, nrow=2,heights=c(10, 1))
+dev.print(png, paste0("figs/timeline2.png"), width=800)
+```
