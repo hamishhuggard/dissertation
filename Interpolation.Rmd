@@ -18,6 +18,7 @@ library('deldir')
 library('ggmap')
 library('automap')
 library('gstat')
+library('gridExtra')
 
 setwd("Desktop/repo/The Good Code for Reals")
 load(file="calc_errs.rda")
@@ -366,7 +367,8 @@ test.interpolations <- function(data, ids, triangles) {
 variogram <- get.variogram(calibrated.data, wide.odin.ids)
 triangles <- get.triangles(wide.odin.ids)
 
-test.interpolations(calibrated.data, wide.odin.ids, triangles)
+results <- test.interpolations(calibrated.data, wide.odin.ids, triangles)
+results
 ```
 
 ```{r wind_and_distance}
@@ -377,6 +379,7 @@ for (i in 1:nrow(triangles)) {
   print(i)
   ps <- get.ps(triangles[i, ])
   sf.errs[i, 'Area'] <- get.triangle.area(ps[[1]], ps[[2]], ps[[3]])
+  triangles[i, 'Area'] <- get.triangle.area(ps[[1]], ps[[2]], ps[[3]])
 }
 
 # Area is currently in degrees^2
@@ -384,19 +387,78 @@ for (i in 1:nrow(triangles)) {
 sa.km <- 510072000 # surface area of earth in km^2
 sa.deg <- 360^2 / pi # surface area of earth in degrees^2
 sf.errs$Area <- sf.errs$Area * sa.km / sa.deg
+triangles$Area <- triangles$Area * sa.km / sa.deg
 
-ggplot(sf.errs) +
-  geom_point(aes(Area, RMSE)) +
-  labs(title="Area vs RMSE", x='Area (m^2)', y='RMSE') +
+one.point <- sf.errs[7, ]
+
+plt.1 <- ggplot(sf.errs, aes(Area, RMSE)) +
+  geom_point() +
+  labs(x=expression('Area (km'^2~')'), y='RMSE') +
   theme(plot.title = element_text(hjust = 0.5)) +
-  expand_limits(y=0, x=0)
+  expand_limits(y=0) +
+  geom_smooth(method='lm', formula=y~x) +
+  geom_point(data=one.point, aes(Area, RMSE), colour="red")
 
-test <- function() {
-  for (i in 1:3) {
-    cat('hello\n')
-    for (j in 1:5)
-      cat('+')
-    cat('\n')
-  }
+plt.2 <- ggplot(sf.errs, aes(Area, MRAE)) +
+  geom_point() +
+  labs(x=expression('Area (km'^2~')'), y='MRAE') +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  expand_limits(y=0) +
+  geom_smooth(method='lm', formula=y~x) +
+  geom_point(data=one.point, aes(Area, MRAE), colour="red")
+
+plt.3 <- ggplot(sf.errs, aes(Area, MAQCE)) +
+  geom_point() +
+  labs(x=expression('Area (km'^2~')'), y='MAQCE') +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  expand_limits(y=0) +
+  geom_smooth(method='lm', formula=y~x) +
+  geom_point(data=one.point, aes(Area, MAQCE), colour="red")
+
+grid.arrange(plt.1, plt.2, plt.3, nrow=1, top='Errors in SF Interpolation against Area of Cell')
+
+for (err in c('RMSE', 'MRAE', 'MAQCE')) {
+  eval(parse(text=paste('print(summary(lm(',err,' ~ Area, sf.errs)))')))
 }
+sf.errs[nrow(sf.errs), 'Area'] <- mean(sf.errs[1:(nrow(sf.errs)-1), 'Area'])
+
+sf.errs
+```
+
+## Wind
+
+```{r wind}
+one.point
+sf.errs[nrow(sf.errs), ]
+
+test.interpolation <- function(data, interpolation, triangles) {
+  # Test one particular interpolation technique across all the triangles
+  
+  rows <- c(as.character(1:nrow(triangles)), 'Mean')
+  results <- get.err.df(rows)
+  
+  for (i in 1:nrow(triangles)) {
+    cat('=')
+    triangle <- triangles[i, ]
+    y.hat <- c()
+    y <- c()
+    for (j in 1:nrow(data)) {
+      line <- data[j, ]
+      ps <- get.ps(triangle, include.w=TRUE, line)
+      y.hat <- c(y.hat, interpolation(ps))
+      y <- c(y, ps[[4]]$w)
+    }
+    results[i, ] <- calculate.errors(unlist(y), unlist(y.hat))
+  }
+  cat('\n')
+  
+  # Calculate means and sds
+  for (i in 1:(ncol(results)/2)) {
+    results[nrow(results), i*2-1] <- mean(results[1:(nrow(results)-1), i*2-1], na.rm=TRUE)
+    results[nrow(results), i*2] <- sd(results[1:(nrow(results)-1), i*2-1], na.rm=TRUE)
+  }
+  
+  results
+}
+
 ```
